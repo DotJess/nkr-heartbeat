@@ -1,0 +1,13 @@
+{
+  "name": "nkr-heartbeat",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Headless-browser caller that fires the Neurokindred reminder window pass every ~15 min (passes Cloudflare's managed challenge).",
+  "scripts": {
+    "start": "node heartbeat.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0"
+  }
+}

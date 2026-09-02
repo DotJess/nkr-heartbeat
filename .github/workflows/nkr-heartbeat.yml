@@ -1,0 +1,70 @@
+# NKR reminder heartbeat — GitHub Actions
+#
+# Fires the Neurokindred per-session reminder pass every ~15 min by hitting the
+# token endpoint with a HEADLESS BROWSER (Playwright Chromium). A plain HTTP
+# caller (curl, cron-job.org, UptimeRobot) CANNOT be used: neurokindred.com is
+# behind a Cloudflare Managed Challenge (verified 02/09/2026 — cf-mitigated:
+# challenge on every path, plain curl gets 403). Only a JS-executing browser
+# passes it; headless Chromium here does, exactly like the in-app browser did.
+#
+# FREE-TIER NOTE: this MUST live in a PUBLIC repo. GitHub bills private-repo
+# Actions per run rounded up to the minute — 96 runs/day ≈ 2,880 min/month,
+# over the 2,000 free private cap. Public repos have unlimited free minutes.
+# The endpoint URL being visible is fine: a wrong/absent token is a proven
+# no-op (returns {"success":false,"data":"bad token"}), so nothing sensitive is
+# exposed. The token itself is an Actions SECRET, never committed.
+#
+# SETUP (one-time):
+#   1. Create/choose a PUBLIC GitHub repo (can be a tiny repo that holds only
+#      this workflow + heartbeat.mjs + package.json).
+#   2. Put this file at .github/workflows/nkr-heartbeat.yml on the DEFAULT
+#      branch (scheduled workflows only run from the default branch).
+#   3. Put heartbeat.mjs and package.json at the repo root.
+#   4. Repo → Settings → Secrets and variables → Actions → New repository secret:
+#        Name:  NKR_TOKEN
+#        Value: the value of NK_REMINDER_TOKEN (see 00-nk-secrets.php on the
+#               server / the nk secret store) — DO NOT commit or paste it into
+#               any file.
+#   5. Actions tab → enable workflows if prompted. First run: use "Run workflow"
+#      (workflow_dispatch) to confirm a green run before relying on the cron.
+#
+# CADENCE / PRECISION: */15 gives ~15-min granularity, so each session is
+# reminded within ~15 min of its own 24h-before mark. GitHub cron is best-effort
+# and can run late or occasionally skip under load; the mu-plugin's lazy
+# per-request trigger is the backstop so nothing is missed, just possibly a
+# little late. Tighter timing later = the cPanel local-php cron (needs Bluehost
+# SSH). Do not drop below */5 (GitHub's minimum) and */15 is the intended rate.
+
+name: NKR reminder heartbeat
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # every 15 minutes (UTC); session timing is handled server-side
+  workflow_dispatch:          # manual "Run workflow" button for testing
+
+# Never run two passes at once; the server throttles anyway, this just keeps the
+# Actions log clean.
+concurrency:
+  group: nkr-heartbeat
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright Chromium
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+
+      - name: Fire reminder heartbeat
+        env:
+          NKR_TOKEN: ${{ secrets.NKR_TOKEN }}
+        run: node heartbeat.mjs
