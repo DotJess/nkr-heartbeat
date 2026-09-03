@@ -6,9 +6,13 @@
 // this every ~15 min is exactly the intended cadence; the per-session Reminder
 // Sent flag prevents any double-send.
 //
-// Exit non-zero only on a genuine failure (challenge not solved, network error,
-// or the endpoint reporting a bad token) so the Actions run shows red and the
-// problem is visible rather than silently swallowed.
+// WAIT STRATEGY: do NOT use waitUntil:'networkidle' — Cloudflare's challenge
+// page keeps network activity alive, so networkidle never settles and the nav
+// times out. Instead we load with 'domcontentloaded', then POLL the body until
+// the challenge has solved client-side and the real admin-ajax JSON appears.
+//
+// Exit codes: 0 ok, 1 no token, 2 challenge not solved (never reached PHP),
+// 3 token rejected, 4 unexpected response — so a genuine failure shows red.
 
 import { chromium } from 'playwright';
 
@@ -22,32 +26,67 @@ const URL =
   'https://neurokindred.com/wp-admin/admin-ajax.php?action=nkr_trigger&token=' +
   encodeURIComponent(TOKEN);
 
-const browser = await chromium.launch();
+const browser = await chromium.launch({
+  args: ['--disable-blink-features=AutomationControlled'],
+});
 try {
-  const page = await browser.newPage();
-  // networkidle so the CF challenge JS has time to run and redirect to the real
-  // endpoint response before we read the body.
-  const resp = await page.goto(URL, { waitUntil: 'networkidle', timeout: 60000 });
-  const status = resp ? resp.status() : 0;
-  const body = await page.evaluate(() => document.body ? document.body.innerText : '');
+  const ctx = await browser.newContext({
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    viewport: { width: 1280, height: 800 },
+    locale: 'en-AU',
+  });
+  const page = await ctx.newPage();
 
-  console.log('HTTP', status);
-  console.log('Body:', body.slice(0, 500));
+  // domcontentloaded, not networkidle. Ignore a nav timeout here; the poll below
+  // is the real readiness check.
+  await page
+    .goto(URL, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    .catch((e) => console.log('initial goto note:', e.message.split('\n')[0]));
 
-  if (/just a moment/i.test(body) || (resp && resp.headers()['cf-mitigated'])) {
-    console.error('Cloudflare challenge was NOT solved — heartbeat did not reach PHP.');
+  // Poll up to ~50s for the challenge to solve and the JSON to appear.
+  let body = '';
+  let reachedPhp = false;
+  for (let i = 0; i < 25; i++) {
+    body = await page
+      .evaluate(() => (document.body ? document.body.innerText : ''))
+      .catch(() => '');
+    if (body.includes('"success"')) {
+      reachedPhp = true;
+      break;
+    }
+    await page.waitForTimeout(2000);
+  }
+
+  console.log('Final body (first 300):', body.slice(0, 300).replace(/\s+/g, ' '));
+
+  if (!reachedPhp) {
+    console.error(
+      'Did NOT reach PHP within timeout — Cloudflare challenge was not solved from this runner IP.'
+    );
     process.exit(2);
   }
 
   let json;
-  try { json = JSON.parse(body); } catch { json = null; }
+  try {
+    json = JSON.parse(body.trim());
+  } catch {
+    json = null;
+  }
 
   if (json && json.success === true) {
-    console.log('OK — reminder window pass fired. last_window_run =', json.data && json.data.last_window_run);
+    console.log(
+      'OK — reminder window pass fired. last_window_run =',
+      json.data && json.data.last_window_run
+    );
     process.exit(0);
   }
-  if (json && json.success === false && String(json.data).toLowerCase().includes('bad token')) {
-    console.error('Endpoint reached but token REJECTED — check the NKR_TOKEN secret matches NK_REMINDER_TOKEN.');
+  if (
+    json &&
+    json.success === false &&
+    String(json.data).toLowerCase().includes('bad token')
+  ) {
+    console.error('Endpoint reached but token REJECTED — check the NKR_TOKEN secret.');
     process.exit(3);
   }
 
