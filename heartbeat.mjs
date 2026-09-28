@@ -57,12 +57,12 @@ const maskToken = (str) => str.split(TOKEN).join('[REDACTED]');
 // the page's HTML (script tags included) and its visible body text. Only a
 // match here counts as a routine skip; anything else that fails to reach
 // PHP (empty body, a 5xx/error page, a dead origin) is a real outage.
+// Note: cf-mitigated is an HTTP response header, not body content, so it
+// is deliberately not checked here as a body-text marker (it would never
+// match and gives false confidence). A future header-based check would
+// need to read the goto() response object directly.
 const CF_CHALLENGE_MARKERS = [
   { name: 'Just a moment', test: (html, text) => text.includes('Just a moment') },
-  {
-    name: 'cf-mitigated',
-    test: (html, text) => html.toLowerCase().includes('cf-mitigated') || text.toLowerCase().includes('cf-mitigated'),
-  },
   {
     name: 'Enable JavaScript and cookies',
     test: (html, text) => text.includes('Enable JavaScript and cookies'),
