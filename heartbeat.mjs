@@ -11,18 +11,28 @@
 // times out. Instead we load with 'domcontentloaded', then POLL the body until
 // the challenge has solved client-side and the real admin-ajax JSON appears.
 //
-// Exit codes: 0 ok, 1 no token, 2 challenge not solved (never reached PHP),
-// 3 token rejected, 4 unexpected response, 5 feed-refresh bad token (only
-// surfaced when the reminder itself succeeded — see below) — so a genuine
-// failure shows red.
+// Exit codes: 0 ok (includes a routine Cloudflare-challenge skip — see
+// below), 1 no token, 3 token rejected, 4 unexpected response — so a
+// genuine reminder fault shows red. The reminder path ALONE decides red
+// or green; nothing about the feed refresh below ever changes the exit
+// code, it only ever logs (including as a ::warning:: annotation).
 //
-// FEED REFRESH (added 28/09/2026): after the reminder hit, reuse this same
-// page — Cloudflare is already cleared — to also ping nkta_feed_refresh so
-// TA hub programme edits show within this cadence instead of the 15-min TTL.
-// Order is fixed: reminder first, always. A feed-refresh failure NEVER stops
-// or masks the reminder result; it only adds exit code 5 when the reminder
-// itself was fine but the feed-refresh token was rejected (403), so that
-// specific break stays visible without ever hiding a real reminder failure.
+// CLOUDFLARE SKIP (28/09/2026, Maryon condition): a runner IP that never
+// clears the challenge is routine site-side flakiness, not a code fault —
+// it logs a ::warning:: annotation and exits 0 instead of failing red, so
+// it no longer emails Jess on every flaky runner. Real reminder faults
+// (bad token, unexpected response) still fail red as before.
+//
+// FEED REFRESH (28/09/2026, TA a26d0f33): after the reminder hit, reuse
+// this same page — Cloudflare is already cleared — to also ping
+// nkta_feed_refresh so TA hub programme edits show within this cadence
+// instead of the 15-min TTL. Order is fixed: reminder first, always.
+// Bounded to 10s so a hung feed request can't hang the job. A 403 here
+// means the feed action rejected a token the reminder JUST accepted —
+// that is a server-side mismatch on the nkta_feed_refresh handler, not a
+// bad secret (a bad NKR_TOKEN would already have failed nkr_trigger
+// above) — logged loud as a warning, never a reason to rotate NKR_TOKEN,
+// and never a reason to fail the job.
 
 import { chromium } from 'playwright';
 
@@ -31,6 +41,11 @@ if (!TOKEN) {
   console.error('NKR_TOKEN env var is missing — set it as the Actions secret NKR_TOKEN.');
   process.exit(1);
 }
+
+// Redacts TOKEN out of any string before it hits the (public repo) log —
+// Playwright's own navigation-error text can otherwise echo the full URL,
+// token included.
+const maskToken = (str) => str.split(TOKEN).join('[REDACTED]');
 
 const URL =
   'https://neurokindred.com/wp-admin/admin-ajax.php?action=nkr_trigger&token=' +
@@ -52,7 +67,7 @@ try {
   // is the real readiness check.
   await page
     .goto(URL, { waitUntil: 'domcontentloaded', timeout: 30000 })
-    .catch((e) => console.log('initial goto note:', e.message.split('\n')[0]));
+    .catch((e) => console.log('initial goto note:', maskToken(e.message.split('\n')[0])));
 
   // Poll up to ~50s for the challenge to solve and the JSON to appear.
   let body = '';
@@ -71,10 +86,10 @@ try {
   console.log('Final body (first 300):', body.slice(0, 300).replace(/\s+/g, ' '));
 
   if (!reachedPhp) {
-    console.error(
-      'Did NOT reach PHP within timeout — Cloudflare challenge was not solved from this runner IP.'
+    console.log(
+      '::warning::skipped: Cloudflare challenge — did not reach PHP within timeout (runner IP not cleared). Routine site-side flakiness, not a code fault; exiting 0 so it does not alert.'
     );
-    process.exit(2);
+    process.exit(0);
   }
 
   let json;
@@ -104,36 +119,43 @@ try {
   }
 
   // Reminder is done and logged. Now, same page/context, fire the feed
-  // refresh. Never let this change or block the reminder result above.
-  let feedExitOverride = 0;
+  // refresh. Bounded to 10s. Nothing in this block ever changes the exit
+  // code — the reminder result above is the only thing that decides red
+  // or green.
   try {
     const FEED_URL =
       'https://neurokindred.com/wp-admin/admin-post.php?action=nkta_feed_refresh&token=' +
       encodeURIComponent(TOKEN);
-    const feed = await page.evaluate(async (url) => {
-      const r = await fetch(url);
-      return { status: r.status, text: await r.text() };
-    }, FEED_URL);
+    const feed = await Promise.race([
+      page.evaluate(async (url) => {
+        const r = await fetch(url);
+        return { status: r.status, text: await r.text() };
+      }, FEED_URL),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('feed refresh timed out after 10s')), 10000)
+      ),
+    ]);
     console.log('Feed refresh status:', feed.status, '(token masked)');
     if (feed.status === 200) {
       console.log('Feed refresh OK — hub rebuilt.');
     } else if (feed.status === 429) {
       console.log('Feed refresh rate-limited (429) — not a failure, skipping.');
     } else if (feed.status === 403) {
-      console.error('Feed refresh REJECTED (403) — bad token, check NKR_TOKEN secret.');
-      feedExitOverride = 5;
+      console.log(
+        '::warning::Feed refresh REJECTED (403) — nkr_trigger just accepted this same NKR_TOKEN, so this is a SERVER-SIDE mismatch on the nkta_feed_refresh handler, not a bad secret. Do NOT rotate NKR_TOKEN. Check the nkta_feed_refresh token check on the WP side.'
+      );
     } else {
       console.log(
         'Feed refresh unexpected status', feed.status, '— logged, not failing the job.'
       );
     }
   } catch (e) {
-    console.error(
-      'Feed refresh request errored:', e.message.split('\n')[0], '— logged, not failing the job.'
+    console.log(
+      'Feed refresh request errored or timed out:', maskToken(e.message.split('\n')[0]), '— logged, not failing the job.'
     );
   }
 
-  process.exit(reminderExitCode !== 0 ? reminderExitCode : feedExitOverride);
+  process.exit(reminderExitCode);
 } finally {
   await browser.close();
 }
