@@ -11,17 +11,23 @@
 // times out. Instead we load with 'domcontentloaded', then POLL the body until
 // the challenge has solved client-side and the real admin-ajax JSON appears.
 //
-// Exit codes: 0 ok (includes a routine Cloudflare-challenge skip — see
-// below), 1 no token, 3 token rejected, 4 unexpected response — so a
-// genuine reminder fault shows red. The reminder path ALONE decides red
-// or green; nothing about the feed refresh below ever changes the exit
-// code, it only ever logs (including as a ::warning:: annotation).
+// Exit codes: 0 ok (includes a CONFIRMED Cloudflare-challenge skip — see
+// below), 1 no token, 2 did not reach PHP and no CF challenge marker
+// found — a real outage (site down, WP 500, empty body), stays red on
+// purpose, 3 token rejected, 4 unexpected response. The reminder path
+// ALONE decides red or green; nothing about the feed refresh below ever
+// changes the exit code, it only ever logs (including as a ::warning::
+// annotation).
 //
-// CLOUDFLARE SKIP (28/09/2026, Maryon condition): a runner IP that never
-// clears the challenge is routine site-side flakiness, not a code fault —
-// it logs a ::warning:: annotation and exits 0 instead of failing red, so
-// it no longer emails Jess on every flaky runner. Real reminder faults
-// (bad token, unexpected response) still fail red as before.
+// CLOUDFLARE SKIP (28/09/2026, Maryon condition, re-checked after a FAIL
+// on the first cut): only skip-and-exit-0 when the page POSITIVELY shows
+// a Cloudflare challenge (one of CF_CHALLENGE_MARKERS below matched in
+// the body/HTML) — the first version keyed off the mere ABSENCE of a
+// success JSON, which would have let a real outage (site down, WP 500,
+// empty body, origin 5xx) go silently green. Anything that doesn't match
+// a marker — empty body, a 5xx/error page, anything unrecognised — stays
+// RED (exit 2), same as before this feature existed. Real reminder
+// faults (bad token, unexpected response) still fail red as before too.
 //
 // FEED REFRESH (28/09/2026, TA a26d0f33): after the reminder hit, reuse
 // this same page — Cloudflare is already cleared — to also ping
@@ -46,6 +52,23 @@ if (!TOKEN) {
 // Playwright's own navigation-error text can otherwise echo the full URL,
 // token included.
 const maskToken = (str) => str.split(TOKEN).join('[REDACTED]');
+
+// Positive signals of an actual Cloudflare challenge page — checked against
+// the page's HTML (script tags included) and its visible body text. Only a
+// match here counts as a routine skip; anything else that fails to reach
+// PHP (empty body, a 5xx/error page, a dead origin) is a real outage.
+const CF_CHALLENGE_MARKERS = [
+  { name: 'Just a moment', test: (html, text) => text.includes('Just a moment') },
+  {
+    name: 'cf-mitigated',
+    test: (html, text) => html.toLowerCase().includes('cf-mitigated') || text.toLowerCase().includes('cf-mitigated'),
+  },
+  {
+    name: 'Enable JavaScript and cookies',
+    test: (html, text) => text.includes('Enable JavaScript and cookies'),
+  },
+  { name: 'challenge-platform script', test: (html) => html.includes('challenge-platform') },
+];
 
 const URL =
   'https://neurokindred.com/wp-admin/admin-ajax.php?action=nkr_trigger&token=' +
@@ -86,10 +109,18 @@ try {
   console.log('Final body (first 300):', body.slice(0, 300).replace(/\s+/g, ' '));
 
   if (!reachedPhp) {
-    console.log(
-      '::warning::skipped: Cloudflare challenge — did not reach PHP within timeout (runner IP not cleared). Routine site-side flakiness, not a code fault; exiting 0 so it does not alert.'
+    const html = await page.content().catch(() => '');
+    const matched = CF_CHALLENGE_MARKERS.find((m) => m.test(html, body));
+    if (matched) {
+      console.log(
+        `::warning::skipped: Cloudflare challenge (marker: ${matched.name}) — did not reach PHP within timeout (runner IP not cleared). Routine site-side flakiness, not a code fault; exiting 0 so it does not alert.`
+      );
+      process.exit(0);
+    }
+    console.error(
+      'Did NOT reach PHP within timeout AND no Cloudflare challenge marker was found — treating as a real outage/error, not a routine skip.'
     );
-    process.exit(0);
+    process.exit(2);
   }
 
   let json;
