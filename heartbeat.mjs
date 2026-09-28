@@ -12,7 +12,17 @@
 // the challenge has solved client-side and the real admin-ajax JSON appears.
 //
 // Exit codes: 0 ok, 1 no token, 2 challenge not solved (never reached PHP),
-// 3 token rejected, 4 unexpected response — so a genuine failure shows red.
+// 3 token rejected, 4 unexpected response, 5 feed-refresh bad token (only
+// surfaced when the reminder itself succeeded — see below) — so a genuine
+// failure shows red.
+//
+// FEED REFRESH (added 28/09/2026): after the reminder hit, reuse this same
+// page — Cloudflare is already cleared — to also ping nkta_feed_refresh so
+// TA hub programme edits show within this cadence instead of the 15-min TTL.
+// Order is fixed: reminder first, always. A feed-refresh failure NEVER stops
+// or masks the reminder result; it only adds exit code 5 when the reminder
+// itself was fine but the feed-refresh token was rejected (403), so that
+// specific break stays visible without ever hiding a real reminder failure.
 
 import { chromium } from 'playwright';
 
@@ -74,24 +84,56 @@ try {
     json = null;
   }
 
+  let reminderExitCode;
   if (json && json.success === true) {
     console.log(
       'OK — reminder window pass fired. last_window_run =',
       json.data && json.data.last_window_run
     );
-    process.exit(0);
-  }
-  if (
+    reminderExitCode = 0;
+  } else if (
     json &&
     json.success === false &&
     String(json.data).toLowerCase().includes('bad token')
   ) {
     console.error('Endpoint reached but token REJECTED — check the NKR_TOKEN secret.');
-    process.exit(3);
+    reminderExitCode = 3;
+  } else {
+    console.error('Unexpected response — treating as failure so it is visible.');
+    reminderExitCode = 4;
   }
 
-  console.error('Unexpected response — treating as failure so it is visible.');
-  process.exit(4);
+  // Reminder is done and logged. Now, same page/context, fire the feed
+  // refresh. Never let this change or block the reminder result above.
+  let feedExitOverride = 0;
+  try {
+    const FEED_URL =
+      'https://neurokindred.com/wp-admin/admin-post.php?action=nkta_feed_refresh&token=' +
+      encodeURIComponent(TOKEN);
+    const feed = await page.evaluate(async (url) => {
+      const r = await fetch(url);
+      return { status: r.status, text: await r.text() };
+    }, FEED_URL);
+    console.log('Feed refresh status:', feed.status, '(token masked)');
+    if (feed.status === 200) {
+      console.log('Feed refresh OK — hub rebuilt.');
+    } else if (feed.status === 429) {
+      console.log('Feed refresh rate-limited (429) — not a failure, skipping.');
+    } else if (feed.status === 403) {
+      console.error('Feed refresh REJECTED (403) — bad token, check NKR_TOKEN secret.');
+      feedExitOverride = 5;
+    } else {
+      console.log(
+        'Feed refresh unexpected status', feed.status, '— logged, not failing the job.'
+      );
+    }
+  } catch (e) {
+    console.error(
+      'Feed refresh request errored:', e.message.split('\n')[0], '— logged, not failing the job.'
+    );
+  }
+
+  process.exit(reminderExitCode !== 0 ? reminderExitCode : feedExitOverride);
 } finally {
   await browser.close();
 }
